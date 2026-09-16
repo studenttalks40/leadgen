@@ -1,750 +1,521 @@
 """
-LeadFinder — Gemini-powered public-web lead finder MVP
+LeadFinder — Gemini-powered public-web lead finder for Vercel.
 
-Run:
-    pip install -r requirements.txt
-    set GEMINI_API_KEY=your_key
+The user can type natural language such as:
+    "Find 10 people to reach at Clay for marketing"
+    "Find senior sales people at Stripe"
+    "Who should I contact at Notion for partnerships?"
+
+Gemini handles both intent understanding and web research through Google Search grounding.
+The app never asks the user to provide a company URL just to begin a search.
+
+Run locally:
     uvicorn app:app --reload
 
-Then open:
-    http://localhost:8000
-
-Notes:
-- Gemini is used for natural-language intent parsing and ranking.
-- People are discovered from public company/team/leadership pages and public search results.
-- Email addresses are only marked "verified" when an exact public email is found on a public source.
-- Pattern-generated emails are explicitly marked "inferred" and are NOT mailbox-verified.
-- No SMTP mailbox enumeration and no Gravatar verification.
+Vercel:
+    app.py + requirements.txt
 """
 
 import os
 import re
 import json
 import asyncio
-from urllib.parse import urljoin, urlparse, quote_plus
-from typing import Optional, Any
+from typing import Any, Optional
 
-import httpx
-import dns.resolver
-from bs4 import BeautifulSoup
 from fastapi import FastAPI
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-try:
-    from google import genai
-    from google.genai import types
-except ImportError:
-    genai = None
-    types = None
+from google import genai
+from google.genai import types
 
 
 app = FastAPI(title="LeadFinder")
 
-UA = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 Chrome/140.0 Safari/537.36 "
-        "LeadFinder/1.0"
-    )
-}
-
-GEMINI_KEY = os.getenv("GEMINI_API_KEY", "")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 
-GEMINI_CLIENT = None
-if genai and GEMINI_KEY:
-    GEMINI_CLIENT = genai.Client(api_key=GEMINI_KEY)
-
-PATTERNS = [
-    "{first}.{last}",
-    "{f}{last}",
-    "{first}{last}",
-    "{first}",
-    "{last}.{first}",
-    "{first}_{last}",
-]
-
-BAD_PATH = re.compile(
-    r"privacy|terms|login|signin|signup|cart|pricing|jobs|career|"
-    r"contact|support|blog|press|news|cookie|legal",
-    re.I,
-)
-
-EMAIL_RE = re.compile(
-    r"\b[A-Z0-9._%+\-]+@[A-Z0-9.\-]+\.[A-Z]{2,}\b", re.I
-)
-
-ROLE_RE = re.compile(
-    r"\b(CEO|CFO|COO|CTO|CIO|CMO|CPO|CSO|"
-    r"Chief|Founder|Co-Founder|President|Partner|"
-    r"VP|Vice President|Head of|Director|Manager|Lead|"
-    r"Marketing|Sales|Engineering|Product|Finance|"
-    r"Operations|Legal|HR|People|Growth|Revenue)\b",
-    re.I,
-)
-
-DEPARTMENT_ALIASES = {
-    "marketing": [
-        "marketing", "growth", "brand", "demand generation",
-        "communications", "content", "performance marketing",
-    ],
-    "sales": [
-        "sales", "revenue", "business development", "bd",
-        "account executive", "commercial",
-    ],
-    "engineering": [
-        "engineering", "software", "developer", "technical",
-        "technology", "platform", "infrastructure",
-    ],
-    "product": [
-        "product", "product management", "product manager",
-    ],
-    "finance": [
-        "finance", "financial", "accounting", "treasury",
-    ],
-    "hr": [
-        "human resources", "people", "talent", "hr",
-        "recruiting", "recruitment",
-    ],
-    "operations": [
-        "operations", "strategy", "business operations",
-    ],
-    "legal": [
-        "legal", "compliance", "privacy", "counsel",
-    ],
-}
-
-SENIORITY_TERMS = {
-    "c_level": ["ceo", "cfo", "coo", "cto", "cmo", "cpo", "cio", "chief"],
-    "vp": ["vp", "vice president"],
-    "director": ["director"],
-    "head": ["head of", "global head", "regional head"],
-    "manager": ["manager"],
-    "lead": ["lead", "principal"],
-}
+GEMINI = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
 
 
-# ----------------------------- HTTP helpers -----------------------------
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
-async def fetch(client: httpx.AsyncClient, url: str, timeout: float = 10) -> str:
+def clean_json(text: str) -> dict:
+    """Parse Gemini's JSON even if it accidentally wraps it in ```json ... ```."""
+    text = (text or "").strip()
+
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.I)
+        text = re.sub(r"\s*```$", "", text).strip()
+
     try:
-        r = await client.get(url, timeout=timeout, follow_redirects=True)
-        if r.status_code == 200 and "text/html" in r.headers.get("content-type", ""):
-            return r.text
-    except Exception:
-        pass
-    return ""
+        return json.loads(text)
+    except json.JSONDecodeError:
+        # Try to recover the first JSON object.
+        start = text.find("{")
+        end = text.rfind("}")
+        if start >= 0 and end > start:
+            return json.loads(text[start:end + 1])
+        raise
 
 
-def clean_domain(value: str) -> str:
-    value = value.strip().lower()
-    value = re.sub(r"^https?://", "", value)
-    value = value.split("/")[0]
-    return value.strip(".")
-
-
-async def find_domain(company: str) -> Optional[str]:
-    """Resolve a company name using Clearbit autocomplete, then web search."""
-    try:
-        async with httpx.AsyncClient(timeout=10, headers=UA) as c:
-            r = await c.get(
-                "https://autocomplete.clearbit.com/v1/companies/suggest",
-                params={"query": company},
-            )
-            if r.status_code == 200:
-                data = r.json()
-                if data:
-                    # Prefer an exact-ish name match.
-                    company_low = company.lower().strip()
-                    for item in data:
-                        name = str(item.get("name", "")).lower()
-                        domain = item.get("domain")
-                        if domain and (company_low in name or name in company_low):
-                            return clean_domain(domain)
-                    for item in data:
-                        if item.get("domain"):
-                            return clean_domain(item["domain"])
-    except Exception:
-        pass
-
-    # Fallback: search engine result URL.
-    try:
-        async with httpx.AsyncClient(timeout=10, headers=UA) as c:
-            q = quote_plus(f"{company} official website")
-            html = await fetch(c, f"https://html.duckduckgo.com/html/?q={q}")
-            soup = BeautifulSoup(html, "html.parser")
-            for a in soup.select("a.result__a, a[href]"):
-                href = a.get("href", "")
-                if not href.startswith("http"):
-                    continue
-                d = clean_domain(urlparse(href).netloc)
-                if d and "duckduckgo" not in d and "google" not in d:
-                    return d
-    except Exception:
-        pass
-
-    return None
-
-
-async def mx_hosts(domain: str) -> list[str]:
-    try:
-        ans = await asyncio.to_thread(dns.resolver.resolve, domain, "MX")
-        return sorted(str(r.exchange).rstrip(".") for r in ans)
-    except Exception:
-        return []
-
-
-# ----------------------------- Public discovery -----------------------------
-
-def normalize_space(s: str) -> str:
-    return re.sub(r"\s+", " ", s or "").strip()
-
-
-def same_domain(url: str, domain: str) -> bool:
-    try:
-        host = urlparse(url).netloc.lower().split(":")[0]
-        return host == domain or host.endswith("." + domain)
-    except Exception:
-        return False
-
-
-def canonical_url(url: str, domain: str) -> Optional[str]:
-    if url.startswith("//"):
-        url = "https:" + url
-    if url.startswith("/"):
-        url = "https://" + domain + url
-    if not url.startswith("http"):
+def object_to_dict(value: Any) -> Any:
+    """Convert Google SDK/Pydantic objects to ordinary Python dictionaries."""
+    if value is None:
         return None
-    if not same_domain(url, domain):
-        return None
-    return url.split("#")[0]
 
-
-def likely_people_link(href: str, text: str = "") -> bool:
-    blob = f"{href} {text}"
-    return bool(
-        re.search(
-            r"team|leadership|people|about|management|executives|"
-            r"company|founders|our-team|meet-the-team",
-            blob,
-            re.I,
-        )
-    ) and not BAD_PATH.search(blob)
-
-
-def extract_jsonld_people(soup: BeautifulSoup, source: str) -> list[dict]:
-    people = []
-    for script in soup.find_all("script", type="application/ld+json"):
-        raw = script.string or script.get_text()
+    if hasattr(value, "model_dump"):
         try:
-            data = json.loads(raw)
+            return value.model_dump(exclude_none=True)
         except Exception:
-            continue
+            pass
 
-        nodes = []
-        if isinstance(data, list):
-            nodes.extend(data)
-        elif isinstance(data, dict):
-            nodes.append(data)
-            graph = data.get("@graph")
-            if isinstance(graph, list):
-                nodes.extend(graph)
+    if isinstance(value, dict):
+        return {k: object_to_dict(v) for k, v in value.items()}
 
-        for n in nodes:
-            if not isinstance(n, dict):
-                continue
-            typ = n.get("@type")
-            if typ == "Person" or (isinstance(typ, list) and "Person" in typ):
-                name = normalize_space(str(n.get("name", "")))
-                role = normalize_space(str(n.get("jobTitle", "")))
-                if name:
-                    people.append({
-                        "name": name,
-                        "role": role,
-                        "src": source,
-                        "source_type": "company_page",
-                        "email": None,
-                    })
-    return people
+    if isinstance(value, list):
+        return [object_to_dict(v) for v in value]
+
+    if hasattr(value, "__dict__"):
+        try:
+            return {
+                k: object_to_dict(v)
+                for k, v in vars(value).items()
+                if not k.startswith("_")
+            }
+        except Exception:
+            pass
+
+    return value
 
 
-def extract_people_from_text(text: str, source: str) -> list[dict]:
-    people = []
+def extract_sources(response: Any) -> list[dict]:
+    """Extract URLs/titles from Gemini Google Search grounding metadata."""
+    data = object_to_dict(response)
+    sources = []
 
-    # Common visible formats:
-    # Jane Doe — VP Marketing
-    # Jane Doe, Chief Marketing Officer
-    # Jane Doe | Head of Marketing
-    pattern = re.compile(
-        r"\b([A-Z][A-Za-z'’\-]{1,25}(?:\s+[A-Z][A-Za-z'’\-]{1,25}){1,3})"
-        r"\s*(?:—|–|\||:|,\s*)\s*"
-        r"((?:Chief|Co[- ]Founder|Founder|President|VP|Vice President|"
-        r"Head of|Director|Manager|Lead|Principal|Senior|Marketing|"
-        r"Sales|Engineering|Product|Finance|Operations|Legal|HR)"
-        r"[^.\n]{2,70})",
-        re.I,
-    )
+    candidates = data.get("candidates", []) if isinstance(data, dict) else []
 
-    for m in pattern.finditer(text):
-        name = normalize_space(m.group(1))
-        role = normalize_space(m.group(2))
-        if len(name.split()) >= 2 and ROLE_RE.search(role):
-            people.append({
-                "name": name,
-                "role": role,
-                "src": source,
-                "source_type": "company_page",
-                "email": None,
-            })
+    for candidate in candidates:
+        metadata = candidate.get("grounding_metadata") or candidate.get(
+            "groundingMetadata"
+        ) or {}
 
-    return people
+        chunks = metadata.get("grounding_chunks") or metadata.get(
+            "groundingChunks"
+        ) or []
 
-
-async def scrape_people(domain: str) -> list[dict]:
-    found: list[dict] = []
-    seen_people = set()
-    visited = set()
-
-    async with httpx.AsyncClient(timeout=12, headers=UA) as c:
-        home_url = f"https://{domain}"
-        home = await fetch(c, home_url)
-        if not home:
-            return []
-
-        soup = BeautifulSoup(home, "html.parser")
-        urls = [home_url]
-
-        for a in soup.find_all("a", href=True):
-            href = canonical_url(a.get("href", ""), domain)
-            text = normalize_space(a.get_text(" ", strip=True))
-            if href and likely_people_link(href, text):
-                if href not in urls:
-                    urls.append(href)
-
-        # Probe conventional pages too.
-        for path in [
-            "/about", "/team", "/leadership", "/company",
-            "/people", "/about-us", "/management", "/founders",
-        ]:
-            urls.append(f"https://{domain}{path}")
-
-        # Keep discovery bounded.
-        urls = list(dict.fromkeys(urls))[:12]
-
-        for url in urls:
-            if url in visited:
-                continue
-            visited.add(url)
-
-            html = home if url == home_url else await fetch(c, url)
-            if not html:
+        for chunk in chunks:
+            web = chunk.get("web") if isinstance(chunk, dict) else None
+            if not web:
                 continue
 
-            page_soup = BeautifulSoup(html, "html.parser")
-            page_text = normalize_space(page_soup.get_text(" ", strip=True))[:120000]
+            uri = web.get("uri")
+            title = web.get("title") or uri
 
-            for p in extract_jsonld_people(page_soup, url):
-                key = (p["name"].lower(), p["role"].lower())
-                if key not in seen_people:
-                    seen_people.add(key)
-                    found.append(p)
+            if uri and not any(s["url"] == uri for s in sources):
+                sources.append({"title": title, "url": uri})
 
-            for p in extract_people_from_text(page_text, url):
-                key = (p["name"].lower(), p["role"].lower())
-                if key not in seen_people:
-                    seen_people.add(key)
-                    found.append(p)
-
-            # Associate exact public emails with nearby names where possible.
-            emails = [e.lower() for e in EMAIL_RE.findall(page_text)]
-            for p in found:
-                if p["src"] != url or p.get("email"):
-                    continue
-                first = p["name"].split()[0].lower()
-                last = p["name"].split()[-1].lower()
-                for email in emails:
-                    local = email.split("@")[0]
-                    if first in local and (last in local or first == local):
-                        p["email"] = email
-                        p["source_type"] = "public_email"
-                        break
-
-            if len(found) >= 60:
-                break
-
-    return found
+    return sources
 
 
-async def public_search_people(company: str, domain: str, intent: dict) -> list[dict]:
-    """Use public search results as a discovery fallback, not as an email database."""
-    queries = [
-        f'site:{domain} "team" "{company}"',
-        f'site:{domain} "leadership" "{company}"',
-        f'site:{domain} "VP" "{company}"',
-        f'site:{domain} "Head of" "{company}"',
-    ]
+# ---------------------------------------------------------------------------
+# Gemini research
+# ---------------------------------------------------------------------------
 
-    if intent.get("department"):
-        queries.insert(
-            0, f'site:{domain} "{intent["department"]}" "{company}"'
-        )
+SYSTEM_PROMPT = """
+You are the research engine inside a lead-finding application.
 
-    out = []
-    seen = set()
+Your job is to understand the user's natural-language request and then SEARCH
+THE PUBLIC WEB yourself using Google Search grounding.
 
-    async with httpx.AsyncClient(timeout=12, headers=UA) as c:
-        for q in queries[:5]:
-            try:
-                html = await fetch(
-                    c,
-                    f"https://html.duckduckgo.com/html/?q={quote_plus(q)}",
-                )
-                soup = BeautifulSoup(html, "html.parser")
-                for result in soup.select(".result")[:10]:
-                    title = normalize_space(
-                        (result.select_one(".result__title") or result).get_text(
-                            " ", strip=True
-                        )
-                    )
-                    snippet_node = result.select_one(".result__snippet")
-                    snippet = normalize_space(
-                        snippet_node.get_text(" ", strip=True)
-                        if snippet_node else ""
-                    )
-                    link_node = result.select_one("a.result__a")
-                    src = link_node.get("href", "") if link_node else ""
-                    blob = f"{title} {snippet}"
+IMPORTANT:
+- Do NOT ask the user for a company URL.
+- Do NOT tell the user to provide a website.
+- Resolve the company from the company name in the request.
+- Search the web for the company and the type of people the user wants.
+- Return the most relevant real people you can find.
+- The requested count is a TARGET, not a requirement. If only 4 strong matches
+  are found when the user asked for 10, return 4. Never invent people to reach
+  the requested count.
+- Prefer current employees and current roles.
+- Prefer first-party company pages, official team pages, company leadership pages,
+  official biographies, and reputable professional/public sources.
+- Use LinkedIn/public professional pages when they appear in Google Search.
+- Match the requested department, function, seniority, location and other
+  constraints as closely as the evidence allows.
+- If the user says "marketing", include marketing/growth/brand/demand-generation
+  people where appropriate, but do not return unrelated functions just to fill
+  the count.
+- If the user asks for "people to reach", prioritize people who are plausible
+  business contacts for the stated goal, such as decision makers or functional
+  owners.
 
-                    # Extract plausible "Name — Role" from title/snippet.
-                    for p in extract_people_from_text(blob, src or q):
-                        key = (p["name"].lower(), p["role"].lower())
-                        if key not in seen:
-                            seen.add(key)
-                            out.append(p)
-            except Exception:
-                continue
+EMAIL RULES:
+- NEVER invent an email address and call it verified.
+- Only put an email in `email` when the exact address is publicly shown by a
+  source you found.
+- If an email is not publicly found, set `email` to null and
+  `email_status` to "not_found".
+- If you derive an address from a clearly established company pattern, you may
+  include it ONLY with `email_status` = "inferred" and it must never be described
+  as verified.
+- Never claim an email is deliverable merely because the company has MX records.
+EMAIL DISCOVERY AND INFERENCE TASK
 
-    return out
+For every person you identify, try to find their professional work email using public web sources.
 
+Follow this process in order:
 
-# ----------------------------- Intent -----------------------------
+STEP 1 — FIND AN EXACT PUBLIC EMAIL
 
-def local_parse_intent(msg: str) -> dict:
-    text = normalize_space(msg)
+Search the web for the person's exact professional email address.
 
-    count_match = re.search(r"\b(\d{1,3})\b", text)
-    count = int(count_match.group(1)) if count_match else 10
-    count = max(1, min(count, 50))
+Search using combinations of:
+- person's full name
+- company name
+- company domain
+- person's job title
+- official company pages
+- public speaker/conference pages
+- public interviews
+- public PDFs/documents
+- GitHub or other professional profiles
+- reputable business directories
+- publicly accessible professional profiles
 
-    department = None
-    for d in DEPARTMENT_ALIASES:
-        if re.search(rf"\b{re.escape(d)}\b", text, re.I):
-            department = d
-            break
+If you find an exact email address that is publicly associated with that person:
 
-    if not department:
-        for d, aliases in DEPARTMENT_ALIASES.items():
-            if any(re.search(rf"\b{re.escape(a)}\b", text, re.I) for a in aliases):
-                department = d
-                break
+email_status = "public"
 
-    seniority = None
-    for level, terms in SENIORITY_TERMS.items():
-        if any(t in text.lower() for t in terms):
-            seniority = level
-            break
+Return the exact email and the URL/source where it was found.
 
-    # Company usually follows "at/for/from/of" and precedes optional department.
-    company = ""
-    m = re.search(
-        r"\b(?:at|from|for|of)\s+([A-Za-z0-9&.,'’\- ]{2,80}?)(?:\s+(?:in|from|within)\s+"
-        r"(?:marketing|sales|engineering|product|finance|hr|operations|legal)\b|$)",
-        text,
-        re.I,
-    )
-    if m:
-        company = normalize_space(m.group(1)).strip(" .,")
-    else:
-        # e.g. "find 10 people at Stripe in marketing"
-        m = re.search(
-            r"\bat\s+([A-Za-z0-9&.,'’\- ]+?)(?:\s+in\s+.+)?$",
-            text,
-            re.I,
-        )
-        if m:
-            company = normalize_space(m.group(1)).strip(" .,")
+DO NOT call an email public unless the exact address was actually found in a public source.
 
-    if not company:
-        company = text
-        company = re.sub(
-            r"^(find|get|show|give|list)\s+\d*\s*(people|contacts|leads|employees)?\s*",
-            "",
-            company,
-            flags=re.I,
-        )
-        company = re.sub(
-            r"\b(in|from|within)\s+(marketing|sales|engineering|product|finance|hr|operations|legal)\b.*$",
-            "",
-            company,
-            flags=re.I,
-        ).strip(" .,")
+--------------------------------------------------
 
-    role_keywords = []
-    if department:
-        role_keywords.extend(DEPARTMENT_ALIASES[department])
+STEP 2 — IF NO EXACT EMAIL IS FOUND
 
-    return {
-        "company": company,
-        "count": count,
-        "department": department,
-        "role_keywords": role_keywords[:12],
-        "seniority": seniority,
-        "location": None,
-        "intent": "find_people",
+If you cannot find an exact public email for the person, DO NOT stop.
+
+Investigate the company's email naming convention.
+
+Look for publicly available email addresses belonging to OTHER employees at the same company.
+
+For example, if you find:
+
+john.smith@company.com
+sarah.jones@company.com
+mike.brown@company.com
+
+you may determine that the company appears to use:
+
+{first}.{last}@company.com
+
+Use multiple examples whenever possible rather than relying on a single example.
+
+--------------------------------------------------
+
+STEP 3 — GENERATE POSSIBLE EMAILS
+
+If there is sufficient evidence for a company email pattern, generate possible email addresses for the target person.
+
+Example:
+
+Person:
+Jane Doe
+
+Company:
+Acme
+
+Observed company pattern:
+{first}.{last}@acme.com
+
+Possible email:
+jane.doe@acme.com
+
+Return:
+
+{
+  "email": null,
+  "email_status": "not_found",
+  "possible_emails": [
+    {
+      "email": "jane.doe@acme.com",
+      "type": "inferred",
+      "confidence": "high",
+      "reason": "The company appears to use the firstname.lastname format based on publicly available employee emails."
     }
+  ]
+}
+
+--------------------------------------------------
+
+STEP 4 — CONFIDENCE
+
+Assign confidence based on evidence.
+
+HIGH:
+- Multiple public employee emails support the same pattern.
+- The target person's full name and company domain are known.
+- The inferred address follows the observed pattern exactly.
+
+MEDIUM:
+- The pattern is supported by limited public evidence.
+- There is some uncertainty about the company's naming convention.
+
+LOW:
+- The pattern is weakly supported or only one ambiguous example exists.
+
+If there is not enough evidence to infer an email, return:
+
+"possible_emails": []
+
+Do NOT invent an email simply because it looks plausible.
+
+--------------------------------------------------
+
+STEP 5 — MULTIPLE POSSIBLE EMAILS
+
+If several company patterns are supported by evidence, you may return up to 3 possible emails.
+
+Example:
+
+{
+  "possible_emails": [
+    {
+      "email": "jane.doe@company.com",
+      "type": "inferred",
+      "confidence": "high",
+      "reason": "Matches the most frequently observed company pattern."
+    },
+    {
+      "email": "jdoe@company.com",
+      "type": "inferred",
+      "confidence": "medium",
+      "reason": "Matches a secondary company email pattern found in public sources."
+    }
+  ]
+}
+
+Never generate random alternatives.
+
+--------------------------------------------------
+
+IMPORTANT RULES
+
+1. Never fabricate a public email.
+2. Never claim an inferred email is verified.
+3. Never claim an inferred email is deliverable.
+4. Clearly distinguish PUBLIC from INFERRED.
+5. Use web evidence whenever possible.
+6. Prefer official company sources and reputable public sources.
+7. Do not use SMTP mailbox enumeration.
+8. Do not ask the user for the company's website or URL.
+9. Resolve the company and domain yourself using web search.
+10. If the requested number of people cannot be found, return the strongest verified matches instead of inventing people.
+11. The requested count is a target, not a requirement.
+12. Every person must have a source supporting their identity/role.
+13. Every public email should have a source supporting the exact email.
+14. Inferred emails must include the evidence/reason for the inference.
+
+RETURN FORMAT
+
+Return JSON only:
+
+{
+  "people": [
+    {
+      "name": "",
+      "title": "",
+      "department": "",
+      "company": "",
+      "domain": "",
+
+      "email": "",
+      "email_status": "public|not_found",
+
+      "possible_emails": [
+        {
+          "email": "",
+          "type": "inferred",
+          "confidence": "high|medium|low",
+          "reason": ""
+        }
+      ],
+
+      "email_pattern": {
+        "pattern": "",
+        "confidence": "high|medium|low",
+        "evidence": []
+      },
+
+      "profile_url": "",
+      "source_url": "",
+      "reason": ""
+    }
+  ]
+}
+OUTPUT we want :
+just the Name of person , where you can find that person like link to x or linkedIn and email if aviable if you did not find email just give all the possible cobination or emial the person an hae as you already known the company email 
+RETURN FORMAT
+
+Return JSON only:
+
+{
+  "people": [
+    {
+      "name": "",
+      "title": "",
+      "department": "",
+      "company": "",
+      "domain": "",
+
+      "email": "",
+      "email_status": "public|not_found",
+
+      "possible_emails": [
+        {
+          "email": "",
+          "type": "inferred",
+          "confidence": "high|medium|low",
+          "reason": ""
+        }
+      ],
+
+      "email_pattern": {
+        "pattern": "",
+        "confidence": "high|medium|low",
+        "evidence": []
+      },
+
+      "profile_url": "",
+      "source_url": "",
+      "reason": ""
+    }
+  ]
+}
+Use this exact shape:
+
+{
+  "company": "resolved company name",
+  "domain": "official domain or null",
+  "interpreted_request": "short description of what the user wants",
+  "people": [
+    {
+      "name": "Full Name",
+      "title": "Current job title",
+      "department": "Marketing/Sales/etc or null",
+      "location": "Location or null",
+      "email": "exact public email or null",
+      "email_status": "public | inferred | not_found",
+      "profile_url": "public professional/profile URL if found, otherwise null",
+      "source_url": "strongest source URL supporting this person",
+      "reason": "one short sentence explaining why this person matches"
+    }
+  ],
+  "notes": "brief note about search coverage or limitations"
+}
+
+Do not put search-result snippets or made-up URLs into source_url.
+Only use URLs actually present in the web research.
+"""
 
 
-async def gemini_json(prompt: str) -> Optional[dict]:
-    if not GEMINI_CLIENT:
-        return None
+async def gemini_research(user_message: str) -> tuple[dict, list[dict]]:
+    if not GEMINI:
+        raise RuntimeError(
+            "GEMINI_API_KEY is not configured. Add it in Vercel Environment Variables."
+        )
+
+    prompt = f"""
+{SYSTEM_PROMPT}
+
+USER REQUEST:
+{user_message}
+
+Search the public web now. Find the best matching real people.
+Remember: fewer strong matches is better than invented matches.
+"""
+
+    config = types.GenerateContentConfig(
+        temperature=0.1,
+        max_output_tokens=5000,
+        tools=[
+            types.Tool(
+                google_search=types.GoogleSearch()
+            )
+        ],
+    )
 
     def call():
-        response = GEMINI_CLIENT.models.generate_content(
+        return GEMINI.models.generate_content(
             model=GEMINI_MODEL,
             contents=prompt,
-            config=types.GenerateContentConfig(
-                temperature=0.1,
-                response_mime_type="application/json",
-            ),
-        )
-        text = (response.text or "").strip()
-        return json.loads(text)
-
-    try:
-        result = await asyncio.to_thread(call)
-        return result if isinstance(result, dict) else None
-    except Exception:
-        return None
-
-
-async def parse_intent(msg: str) -> dict:
-    fallback = local_parse_intent(msg)
-
-    prompt = f"""
-Parse this lead-finding request into JSON.
-
-User request:
-{msg}
-
-Return ONLY JSON with exactly these keys:
-company: string
-count: integer from 1 to 50
-department: one of marketing, sales, engineering, product, finance, hr, operations, legal, or null
-role_keywords: array of concise role/department keywords
-seniority: one of c_level, vp, director, head, manager, lead, or null
-location: string or null
-intent: "find_people"
-
-Rules:
-- Do not invent a company.
-- If the request says "10 people at Stripe in marketing", company is Stripe,
-  count is 10, department is marketing.
-- If no count is stated, use 10.
-- If no department is stated, use null.
-"""
-    parsed = await gemini_json(prompt)
-
-    if not parsed:
-        return fallback
-
-    # Sanitize Gemini output.
-    parsed["company"] = normalize_space(str(parsed.get("company") or fallback["company"]))
-    try:
-        parsed["count"] = max(1, min(int(parsed.get("count", fallback["count"])), 50))
-    except Exception:
-        parsed["count"] = fallback["count"]
-
-    dep = parsed.get("department")
-    parsed["department"] = dep if dep in DEPARTMENT_ALIASES else fallback["department"]
-    parsed["role_keywords"] = (
-        parsed.get("role_keywords")
-        if isinstance(parsed.get("role_keywords"), list)
-        else fallback["role_keywords"]
-    )
-    parsed["seniority"] = (
-        parsed.get("seniority")
-        if parsed.get("seniority") in SENIORITY_TERMS
-        else fallback["seniority"]
-    )
-    parsed["location"] = parsed.get("location") or fallback["location"]
-    parsed["intent"] = "find_people"
-    return parsed
-
-
-# ----------------------------- Matching / ranking -----------------------------
-
-def role_matches(role: str, intent: dict) -> bool:
-    role_low = role.lower()
-
-    dep = intent.get("department")
-    if dep:
-        aliases = DEPARTMENT_ALIASES.get(dep, [])
-        if not any(alias.lower() in role_low for alias in aliases):
-            return False
-
-    seniority = intent.get("seniority")
-    if seniority:
-        terms = SENIORITY_TERMS.get(seniority, [])
-        if not any(t in role_low for t in terms):
-            return False
-
-    return True
-
-
-def deterministic_score(person: dict, intent: dict) -> int:
-    role = person.get("role", "")
-    score = 0
-
-    if role_matches(role, intent):
-        score += 100
-
-    if person.get("email"):
-        score += 40
-
-    src = person.get("src", "")
-    if src and same_domain(src, intent.get("_domain", "")):
-        score += 15
-
-    if re.search(r"\b(chief|vp|vice president|head|director)\b", role, re.I):
-        score += 15
-
-    if re.search(r"\b(founder|co-founder|ceo)\b", role, re.I):
-        score += 10
-
-    return score
-
-
-async def llm_rank(people: list[dict], intent: dict) -> list[dict]:
-    if not people or not GEMINI_CLIENT:
-        return sorted(
-            people,
-            key=lambda p: deterministic_score(p, intent),
-            reverse=True,
+            config=config,
         )
 
-    compact = [
-        {
-            "id": i,
-            "name": p.get("name", ""),
-            "role": p.get("role", ""),
-            "email": p.get("email"),
-            "source": p.get("src", ""),
-        }
-        for i, p in enumerate(people[:60])
-    ]
+    response = await asyncio.to_thread(call)
+    sources = extract_sources(response)
 
-    prompt = f"""
-You are ranking already-discovered public professional contacts.
+    data = clean_json(response.text)
 
-User intent:
-{json.dumps(intent, ensure_ascii=False)}
+    if not isinstance(data, dict):
+        raise ValueError("Gemini returned an unexpected response.")
 
-Candidates:
-{json.dumps(compact, ensure_ascii=False)}
+    people = data.get("people")
+    if not isinstance(people, list):
+        data["people"] = []
 
-Return ONLY a JSON object:
-{{"ids":[integer,...]}}
+    # Defensive cleanup: make sure a malformed model response cannot break UI.
+    cleaned = []
+    for p in data.get("people", []):
+        if not isinstance(p, dict):
+            continue
 
-Rank candidates by relevance to the requested department, role and seniority.
-Prefer exact role matches and public exact emails.
-NEVER create people or emails. Only return candidate IDs from the supplied list.
-"""
-    result = await gemini_json(prompt)
+        name = str(p.get("name") or "").strip()
+        title = str(p.get("title") or "").strip()
 
-    if result and isinstance(result.get("ids"), list):
-        by_id = {i: p for i, p in enumerate(people[:60])}
-        ranked = [by_id[i] for i in result["ids"] if isinstance(i, int) and i in by_id]
-        seen = {id(p) for p in ranked}
-        ranked.extend(
-            p for p in sorted(
-                people,
-                key=lambda x: deterministic_score(x, intent),
-                reverse=True,
-            )
-            if id(p) not in seen
+        if not name:
+            continue
+
+        status = str(p.get("email_status") or "not_found").lower()
+        if status not in {"public", "inferred", "not_found"}:
+            status = "not_found"
+
+        email = p.get("email")
+        if email is not None:
+            email = str(email).strip() or None
+
+        # If Gemini gives no email, status must be not_found.
+        if not email:
+            status = "not_found"
+
+        cleaned.append(
+            {
+                "name": name,
+                "title": title or "Role not found",
+                "department": p.get("department"),
+                "location": p.get("location"),
+                "email": email,
+                "email_status": status,
+                "profile_url": p.get("profile_url"),
+                "source_url": p.get("source_url"),
+                "reason": p.get("reason") or "",
+            }
         )
-        return ranked
 
-    return sorted(
-        people,
-        key=lambda p: deterministic_score(p, intent),
-        reverse=True,
-    )
+    data["people"] = cleaned
+
+    return data, sources
 
 
-# ----------------------------- Email engine -----------------------------
-
-def name_parts(name: str) -> tuple[str, str]:
-    parts = re.findall(r"[A-Za-zÀ-ÖØ-öø-ÿ]+", name)
-    if len(parts) < 2:
-        return (parts[0] if parts else "", "")
-    return parts[0], parts[-1]
-
-
-def generate_candidates(first: str, last: str, domain: str) -> list[str]:
-    if not first or not last:
-        return []
-    out = []
-    seen = set()
-    for p in PATTERNS:
-        local = p.format(
-            first=first.lower(),
-            last=last.lower(),
-            f=first[0].lower(),
-        )
-        email = f"{local}@{domain}"
-        if email not in seen:
-            seen.add(email)
-            out.append(email)
-    return out
-
-
-def exact_public_email_for_person(person: dict, domain: str) -> Optional[str]:
-    email = person.get("email")
-    if email and email.lower().endswith("@" + domain.lower()):
-        return email.lower()
-    return None
-
-
-async def enrich_email(person: dict, domain: str, mx: list[str]) -> dict:
-    exact = exact_public_email_for_person(person, domain)
-    first, last = name_parts(person.get("name", ""))
-
-    if exact:
-        return {
-            "email": exact,
-            "email_status": "verified",
-            "email_how": "exact public email found on a public source",
-        }
-
-    candidates = generate_candidates(first, last, domain)
-    if candidates:
-        return {
-            "email": candidates[0],
-            "email_status": "inferred",
-            "email_how": "generated from a common company email pattern; not mailbox-verified",
-        }
-
-    return {
-        "email": None,
-        "email_status": "unknown",
-        "email_how": "no reliable public email found",
-    }
-
-
-# ----------------------------- API -----------------------------
+# ---------------------------------------------------------------------------
+# API
+# ---------------------------------------------------------------------------
 
 class ChatIn(BaseModel):
     message: str
@@ -753,123 +524,105 @@ class ChatIn(BaseModel):
 @app.get("/api/health")
 async def health():
     return {
-        "ok": True,
-        "gemini_configured": bool(GEMINI_CLIENT),
-        "gemini_model": GEMINI_MODEL,
+        "ok": bool(GEMINI),
+        "gemini_configured": bool(GEMINI),
+        "model": GEMINI_MODEL,
+        "search": "Google Search grounding",
     }
 
 
 @app.post("/api/chat")
 async def chat(body: ChatIn):
-    steps = ["Understanding your request…"]
-    intent = await parse_intent(body.message)
+    message = (body.message or "").strip()
 
-    company = intent.get("company", "").strip()
-    if not company:
+    if not message:
         return {
-            "steps": steps,
+            "steps": ["Please enter what kind of person you want to find."],
             "results": [],
-            "reply": "Tell me the company and who you want to find.",
+            "reply": "Tell me who you want to reach and which company or function.",
         }
 
-    steps.append(
-        f"Searching for {intent.get('count', 10)} people at {company}"
-        + (f" in {intent['department']}" if intent.get("department") else "")
-        + "…"
-    )
+    steps = [
+        "Understanding your request…",
+        "Gemini is searching the public web…",
+    ]
 
-    domain = await find_domain(company)
-    if not domain:
+    try:
+        data, sources = await gemini_research(message)
+    except Exception as exc:
+        # Don't expose API keys or internal details to the browser.
+        print("Gemini research error:", repr(exc))
         return {
-            "steps": steps + ["Could not resolve the company domain."],
-            "results": [],
-            "reply": f"I couldn't resolve the official domain for “{company}”. Try adding the company's website.",
-        }
-
-    intent["_domain"] = domain
-    steps.append(f"Company domain: {domain}")
-
-    mx = await mx_hosts(domain)
-    steps.append(
-        "Email receiving (MX) records found."
-        if mx
-        else "No MX records were found."
-    )
-
-    steps.append("Scanning public company/team pages…")
-    people = await scrape_people(domain)
-
-    if len(people) < intent["count"]:
-        steps.append("Expanding discovery with public web search…")
-        extra = await public_search_people(company, domain, intent)
-
-        existing = {(p["name"].lower(), p["role"].lower()) for p in people}
-        for p in extra:
-            key = (p["name"].lower(), p["role"].lower())
-            if key not in existing:
-                existing.add(key)
-                people.append(p)
-
-    if not people:
-        return {
-            "steps": steps + ["No named public contacts were found."],
+            "steps": steps + [
+                "Gemini could not complete the web research."
+            ],
             "results": [],
             "reply": (
-                f"I found {domain}, but couldn't find enough named people on "
-                "public pages. Try a broader department or a different company query."
+                "I couldn't complete the search right now. "
+                "Check that GEMINI_API_KEY is configured and that the selected "
+                "Gemini model supports Google Search grounding."
             ),
         }
 
-    # Prefer exact requested department/seniority, but don't return nothing
-    # if public data is sparse.
-    matched = [p for p in people if role_matches(p.get("role", ""), intent)]
-    pool = matched if matched else people
-
-    steps.append(f"Found {len(people)} public candidate profiles.")
-
-    ranked = await llm_rank(pool, intent)
-    target = ranked[: max(intent["count"], 1)]
-
-    results = []
-    for p in target:
-        email_data = await enrich_email(p, domain, mx)
-        results.append({
-            "name": p.get("name", ""),
-            "role": p.get("role", "") or "Role not stated",
-            "email": email_data["email"],
-            "email_status": email_data["email_status"],
-            "email_how": email_data["email_how"],
-            "source": p.get("src", ""),
-            "source_type": p.get("source_type", "public_web"),
-        })
-
-    verified = sum(1 for r in results if r["email_status"] == "verified")
-    inferred = sum(1 for r in results if r["email_status"] == "inferred")
+    people = data.get("people", [])
+    requested_company = data.get("company") or "the requested company"
+    domain = data.get("domain")
 
     steps.append(
-        f"Prepared {len(results)} contacts: {verified} exact public emails, "
-        f"{inferred} inferred emails."
+        f"Found {len(people)} relevant public contacts"
+        + (f" at {requested_company}" if requested_company else "")
     )
 
-    reply = (
-        f"Found {len(results)} relevant public contacts for {company}. "
-        f"{verified} have exact public emails; {inferred} emails are inferred "
-        "from naming patterns and are not mailbox-verified."
+    public_emails = sum(
+        1 for p in people if p.get("email_status") == "public"
     )
+    inferred_emails = sum(
+        1 for p in people if p.get("email_status") == "inferred"
+    )
+
+    if people:
+        reply = (
+            f"I found {len(people)} relevant people for {requested_company}."
+        )
+
+        if public_emails:
+            reply += f" {public_emails} have publicly listed emails."
+        if inferred_emails:
+            reply += f" {inferred_emails} have inferred emails."
+        if domain:
+            reply += f" Company domain: {domain}."
+
+        notes = data.get("notes")
+        if notes:
+            reply += f" {notes}"
+    else:
+        reply = (
+            f"I couldn't find a strong public match for {requested_company}. "
+            "I did not invent people just to reach the requested number."
+        )
 
     return {
         "steps": steps,
-        "intent": intent,
-        "domain": domain,
-        "mx": bool(mx),
-        "results": results,
+        "results": people,
         "reply": reply,
+        "company": requested_company,
+        "domain": domain,
+        "interpreted_request": data.get("interpreted_request"),
+        "sources": sources[:20],
     }
 
 
+# ---------------------------------------------------------------------------
+# UI
+# ---------------------------------------------------------------------------
+
 @app.get("/")
-async def index():
+def index():
     return FileResponse("static/index.html")
 
 
-app.mount("/static", StaticFiles(directory="static"), name="static")
+app.mount(
+    "/static",
+    StaticFiles(directory="static"),
+    name="static",
+)
