@@ -42,7 +42,7 @@ OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "").strip()
 # You can override this with another OpenRouter model later.
 OPENROUTER_MODEL = os.getenv(
     "OPENROUTER_MODEL",
-    "openrouter/free"
+    "liquid/lfm-2.5-2.6b:free"
 ).strip()
 
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
@@ -731,26 +731,33 @@ instructions.
             }
         ],
 
-        # OpenRouter server-side public web search.
-        "tools": [
+        # FAST ONE-SHOT WEB SEARCH.
+        # This is intentionally the web plugin, not the newer
+        # agentic server tool. The server tool can search 0..N times
+        # and is slower for this lead-finder workflow.
+        "plugins": [
             {
-                "type": "openrouter:web_search",
-                "parameters": {
-                    "engine": "auto",
-                    "max_results": 3,
-                    "max_total_results": 6,
-                    "search_context_size": "low"
-                }
+                "id": "web",
+                "max_results": 3,
+                "search_prompt": (
+                    "Find public sources relevant to the user's company/contact request. "
+                    "Prioritize official company team/leadership pages, public professional profiles, "
+                    "company announcements, and other trustworthy public sources. "
+                    "Focus on identifying real people and their current roles. "
+                    "Do not invent people or emails."
+                )
             }
         ],
 
         "temperature": 0,
 
-        # Keep web research to a single search round for speed.
-        "max_tool_calls": 1,
+        # Keep the final response small and fast.
+        "max_tokens": 1800,
 
-        # Enough room for structured results without making the response huge.
-        "max_tokens": 2200
+        # Ask the model for machine-readable JSON.
+        "response_format": {
+            "type": "json_object"
+        }
     }
 
     try:
@@ -758,7 +765,7 @@ instructions.
         async with httpx.AsyncClient(
             timeout=httpx.Timeout(
                 connect=10,
-                read=60,
+                read=45,
                 write=15,
                 pool=10
             )
@@ -884,8 +891,8 @@ instructions.
         )
 
         result = empty_response(
-            "The web research took too long. "
-            "Please try again."
+            "OpenRouter web search timed out after 45 seconds. "
+            "The search request did not finish."
         )
         result["error"] = "openrouter_timeout"
         return result
