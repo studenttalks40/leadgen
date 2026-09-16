@@ -1,16 +1,20 @@
 """
-LeadFinder — AI web-research lead finder
+LeadFinder AI
+Generic natural-language company/contact researcher.
 
-Run:
+Run locally:
     uvicorn app:app --reload
 
-Then open:
-    http://localhost:8000
+Environment:
+    OPENROUTER_API_KEY=sk-or-...
+    OPENROUTER_MODEL=openrouter/free
+    APP_URL=https://your-app.vercel.app
 """
 
 import os
 import json
 import re
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -20,224 +24,698 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 
-# ---------------------------------------------------------
-# APP
-# ---------------------------------------------------------
+# ============================================================
+# APP CONFIG
+# ============================================================
 
-app = FastAPI(title="LeadFinder AI")
+BASE_DIR = Path(__file__).resolve().parent
+STATIC_DIR = BASE_DIR / "static"
 
+app = FastAPI(
+    title="LeadFinder AI",
+    version="2.0.0"
+)
 
-# ---------------------------------------------------------
-# OPENROUTER
-# ---------------------------------------------------------
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "").strip()
 
-OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
-OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "openrouter/free")
+# Generic free router.
+# You can override this with another OpenRouter model later.
+OPENROUTER_MODEL = os.getenv(
+    "OPENROUTER_MODEL",
+    "openrouter/free"
+).strip()
 
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 
 APP_URL = os.getenv(
     "APP_URL",
-    "https://your-domain.vercel.app"
-)
+    "http://localhost:8000"
+).strip()
 
 
-# ---------------------------------------------------------
-# HELPERS
-# ---------------------------------------------------------
+# ============================================================
+# REQUEST MODEL
+# ============================================================
+
+class ChatIn(BaseModel):
+    message: str
+
+
+# ============================================================
+# DEFAULT EMPTY RESPONSE
+# ============================================================
+
+def empty_response(message: str = "") -> dict:
+    return {
+        "company": "",
+        "domain": "",
+        "interpreted_request": {
+            "count": 10,
+            "department": "",
+            "role": "",
+            "seniority": "",
+            "location": ""
+        },
+        "email_pattern": {
+            "pattern": "",
+            "confidence": "",
+            "evidence": []
+        },
+        "people": [],
+        "results": [],
+        "notes": [],
+        "reply": message,
+        "count": 0
+    }
+
+
+# ============================================================
+# JSON CLEANER
+# ============================================================
 
 def clean_json(text: str) -> Any:
     """
-    Convert model output into JSON even if the model
-    wraps it inside ```json ... ```
+    Extract JSON from model output.
+
+    Handles:
+    - normal JSON
+    - ```json ... ```
+    - extra text surrounding JSON
     """
 
     if not text:
-        return {}
+        return None
 
     text = text.strip()
 
-    # Remove markdown code fences
-    text = re.sub(r"^```json\s*", "", text, flags=re.I)
-    text = re.sub(r"^```\s*", "", text)
-    text = re.sub(r"\s*```$", "", text)
+    # Remove markdown code fences.
+    text = re.sub(
+        r"^```(?:json)?\s*",
+        "",
+        text,
+        flags=re.I
+    )
 
-    text = text.strip()
+    text = re.sub(
+        r"\s*```$",
+        "",
+        text
+    )
 
+    # First try the entire response.
     try:
         return json.loads(text)
     except Exception:
         pass
 
-    # Try extracting first JSON object
+    # Find first JSON object.
     start = text.find("{")
     end = text.rfind("}")
 
-    if start != -1 and end != -1 and end > start:
+    if start != -1 and end > start:
+        candidate = text[start:end + 1]
+
         try:
-            return json.loads(text[start:end + 1])
+            return json.loads(candidate)
         except Exception:
             pass
 
+    # Find JSON array as fallback.
+    start = text.find("[")
+    end = text.rfind("]")
+
+    if start != -1 and end > start:
+        candidate = text[start:end + 1]
+
+        try:
+            return json.loads(candidate)
+        except Exception:
+            pass
+
+    return None
+
+
+# ============================================================
+# NORMALIZATION HELPERS
+# ============================================================
+
+def safe_string(value: Any) -> str:
+    if value is None:
+        return ""
+
+    if isinstance(value, str):
+        return value.strip()
+
+    return str(value).strip()
+
+
+def normalize_status(value: Any) -> str:
+    status = safe_string(value).lower()
+
+    if status in {
+        "public",
+        "publicly listed",
+        "public_email",
+        "published"
+    }:
+        return "public"
+
+    if status in {
+        "inferred",
+        "inference",
+        "pattern",
+        "probable"
+    }:
+        return "inferred"
+
+    if status in {
+        "invalid",
+        "rejected"
+    }:
+        return "invalid"
+
+    return "not_found"
+
+
+def normalize_person(person: Any) -> dict | None:
+    """
+    Convert whatever the model returns into the exact structure
+    expected by the frontend.
+    """
+
+    if not isinstance(person, dict):
+        return None
+
+    name = safe_string(
+        person.get("name")
+        or person.get("full_name")
+    )
+
+    if not name:
+        return None
+
+    role = safe_string(
+        person.get("role")
+        or person.get("title")
+        or person.get("job_title")
+    )
+
+    department = safe_string(
+        person.get("department")
+    )
+
+    seniority = safe_string(
+        person.get("seniority")
+    )
+
+    location = safe_string(
+        person.get("location")
+    )
+
+    email = safe_string(
+        person.get("email")
+    )
+
+    email_status = normalize_status(
+        person.get("email_status")
+        or person.get("status")
+    )
+
+    profile_url = safe_string(
+        person.get("profile_url")
+        or person.get("linkedin_url")
+        or person.get("profile")
+    )
+
+    source_url = safe_string(
+        person.get("source_url")
+        or person.get("source")
+    )
+
+    reason = safe_string(
+        person.get("reason")
+        or person.get("email_reason")
+    )
+
+    possible_emails = person.get("possible_emails", [])
+
+    if not isinstance(possible_emails, list):
+        possible_emails = []
+
+    possible_emails = [
+        safe_string(x)
+        for x in possible_emails
+        if safe_string(x)
+    ][:5]
+
+    # If an email exists but the model forgot to specify the status,
+    # treat it as not_found only if it is empty; otherwise infer status.
+    if email and email_status == "not_found":
+        email_status = "public"
+
     return {
-        "company": "",
-        "domain": "",
-        "people": [],
-        "reply": text,
-        "notes": []
+        "name": name,
+        "role": role,
+        "department": department,
+        "seniority": seniority,
+        "location": location,
+        "email": email,
+        "email_status": email_status,
+        "possible_emails": possible_emails,
+        "profile_url": profile_url,
+        "source_url": source_url,
+        "reason": reason
     }
 
 
-# ---------------------------------------------------------
-# AI RESEARCH PROMPT
-# ---------------------------------------------------------
+def normalize_result(data: Any) -> dict:
+    """
+    Normalize the AI response so the frontend always receives:
+
+        company
+        domain
+        interpreted_request
+        email_pattern
+        people
+        results
+        notes
+        reply
+        count
+    """
+
+    if not isinstance(data, dict):
+        return empty_response(
+            "I couldn't structure the research results."
+        )
+
+    company = safe_string(
+        data.get("company")
+    )
+
+    domain = safe_string(
+        data.get("domain")
+    )
+
+    interpreted = data.get(
+        "interpreted_request",
+        {}
+    )
+
+    if not isinstance(interpreted, dict):
+        interpreted = {}
+
+    count = interpreted.get("count", 10)
+
+    try:
+        count = int(count)
+    except Exception:
+        count = 10
+
+    count = max(1, min(count, 50))
+
+    interpreted_request = {
+        "count": count,
+        "department": safe_string(
+            interpreted.get("department")
+        ),
+        "role": safe_string(
+            interpreted.get("role")
+        ),
+        "seniority": safe_string(
+            interpreted.get("seniority")
+        ),
+        "location": safe_string(
+            interpreted.get("location")
+        )
+    }
+
+    email_pattern = data.get(
+        "email_pattern",
+        {}
+    )
+
+    if not isinstance(email_pattern, dict):
+        email_pattern = {}
+
+    pattern = {
+        "pattern": safe_string(
+            email_pattern.get("pattern")
+        ),
+        "confidence": safe_string(
+            email_pattern.get("confidence")
+        ),
+        "evidence": email_pattern.get(
+            "evidence",
+            []
+        )
+    }
+
+    if not isinstance(pattern["evidence"], list):
+        pattern["evidence"] = []
+
+    pattern["evidence"] = [
+        safe_string(x)
+        for x in pattern["evidence"]
+        if safe_string(x)
+    ][:10]
+
+    # The model may use either "people" or "results".
+    raw_people = data.get("people")
+
+    if not isinstance(raw_people, list):
+        raw_people = data.get("results", [])
+
+    if not isinstance(raw_people, list):
+        raw_people = []
+
+    people = []
+
+    seen = set()
+
+    for raw_person in raw_people:
+
+        person = normalize_person(raw_person)
+
+        if not person:
+            continue
+
+        key = (
+            person["name"].lower(),
+            person["role"].lower()
+        )
+
+        if key in seen:
+            continue
+
+        seen.add(key)
+        people.append(person)
+
+    # IMPORTANT:
+    # Contacts are people found by research, not people whose
+    # emails happened to pass a separate verification step.
+    people = people[:count]
+
+    notes = data.get("notes", [])
+
+    if not isinstance(notes, list):
+        notes = [notes]
+
+    notes = [
+        safe_string(x)
+        for x in notes
+        if safe_string(x)
+    ][:10]
+
+    reply = safe_string(
+        data.get("reply")
+    )
+
+    # Generate a clean fallback summary.
+    if not reply:
+
+        if people:
+            reply = (
+                f"Found {len(people)} relevant "
+                f"public contact"
+                f"{'s' if len(people) != 1 else ''}"
+                f"{' at ' + company if company else ''}."
+            )
+        else:
+            reply = (
+                f"No matching public contacts were found"
+                f"{' for ' + company if company else ''}."
+            )
+
+    return {
+        "company": company,
+        "domain": domain,
+        "interpreted_request": interpreted_request,
+        "email_pattern": pattern,
+        "people": people,
+
+        # Keep both names for frontend compatibility.
+        "results": people,
+
+        "notes": notes,
+        "reply": reply,
+
+        # THIS is the number the UI should display.
+        "count": len(people)
+    }
+
+
+# ============================================================
+# AI SYSTEM PROMPT
+# ============================================================
 
 SYSTEM_PROMPT = r"""
-You are LeadFinder, an AI research assistant that finds public business
-contacts from the web.
+You are LeadFinder AI, a business-contact research assistant.
 
-The user will give you a natural-language request such as:
+Your job is to understand natural-language requests and research
+PUBLIC information on the web.
 
-"find 10 people at Stripe in marketing"
+Users may say things like:
 
-"who should I contact at Clay for partnerships"
+"find me 10 people to contact at Stripe in marketing"
 
-"find the head of marketing at OpenAI"
+"who should I reach out to at OpenAI for partnerships?"
 
-Your job:
+"find sales leaders at Notion"
 
-1. Understand the request yourself.
-2. Identify the company.
-3. Identify the requested department, role, seniority, location,
-   quantity and other constraints.
-4. Use web search extensively.
-5. Search the company's official website and other reliable public sources.
-6. Find real people who actually work at the company.
-7. Find a public business email when one is explicitly published.
-8. If an email is not publicly available, investigate the company's
-   public email convention using real publicly visible employee emails.
-9. You may infer an email only when there is evidence supporting the pattern.
-10. Never invent a person.
-11. Never invent an email and call it verified.
-12. Never claim an inferred email is deliverable.
-13. Do not use SMTP mailbox enumeration.
-14. Do not use Gravatar as mailbox verification.
+"give me 5 founders at a fintech company"
 
-Email statuses:
+"find someone in HR at Canva in the US"
 
-"public"
-    Exact email was publicly found.
+The request can contain:
+- company
+- number of people
+- department
+- job function
+- exact role
+- seniority
+- location
+- other relevant constraints
 
-"inferred"
-    Email was generated from a supported company email pattern.
+You MUST understand the request semantically.
+Do not rely on a rigid regex parser.
 
-"not_found"
-    No reliable email could be found or inferred.
+============================================================
+RESEARCH
+============================================================
 
-For inferred emails:
-- confidence must be high, medium or low.
-- explain the evidence.
-- never call the email verified.
+Use web search to find real people who are publicly associated
+with the requested company.
+
+Prefer:
+1. Official company websites
+2. Official leadership/team pages
+3. Company newsroom pages
+4. Public professional profiles
+5. Reputable public business sources
+6. Public interviews, conference pages, podcasts, articles,
+   company announcements, etc.
+
+Do NOT invent people.
+
+A person should only be returned when there is reasonable
+public evidence that they work at or are associated with the
+requested company.
+
+============================================================
+RELEVANCE
+============================================================
+
+Match the user's request.
+
+For example, if the user asks for:
+
+"marketing"
+
+include people whose actual role relates to marketing,
+growth marketing, product marketing, brand marketing,
+demand generation, marketing leadership, etc.
+
+If the user asks for:
+
+"sales"
+
+prioritize sales leadership, sales operations, revenue,
+business development, account executives, etc.
+
+If the user asks for a specific role, prioritize that role.
+
+If the user specifies seniority, respect it.
+
+If the user specifies a location, use it when public evidence
+supports it.
+
+Do not simply return random executives from the company.
+
+============================================================
+EMAILS
+============================================================
+
+Emails require special care.
+
+FIRST:
+Look for an exact individual email address that is publicly
+documented on a public source.
+
+If an exact email is publicly documented:
+
+    email_status = "public"
+
+If no exact public email exists:
+
+You MAY infer an email address only when there is public
+evidence for the company's email naming convention.
+
+For example, if public employee emails demonstrate:
+
+firstname.lastname@company.com
+
+and you find:
+
+John Smith
+
+you may infer:
+
+john.smith@company.com
+
+But mark it:
+
+    email_status = "inferred"
+
+and explain the evidence.
+
+NEVER claim an inferred email is verified.
+
+NEVER invent a supposedly verified email.
+
+NEVER use SMTP mailbox enumeration.
+
+NEVER use Gravatar as proof that an email mailbox exists.
+
+If there is not enough evidence to infer an email:
+
+    email = ""
+    email_status = "not_found"
+
+The person should STILL be returned.
+
+A missing email does NOT mean the person should be removed.
+
+============================================================
+SOURCES
+============================================================
+
+For every person, provide:
+- profile_url when available
+- source_url when available
+- a short reason explaining why the person matches
+
+Do not fabricate URLs.
+
+============================================================
+OUTPUT
+============================================================
 
 Return ONLY valid JSON.
 
-Use this exact structure:
+Use exactly this structure:
 
 {
-  "company": "Company Name",
-  "domain": "company.com",
+  "company": "",
+  "domain": "",
   "interpreted_request": {
     "count": 10,
-    "department": "marketing",
+    "department": "",
     "role": "",
     "seniority": "",
     "location": ""
   },
   "email_pattern": {
-    "pattern": "{first}.{last}@company.com",
-    "confidence": "high",
-    "evidence": [
-      "Public employee email found using firstname.lastname pattern"
-    ]
+    "pattern": "",
+    "confidence": "",
+    "evidence": []
   },
   "people": [
     {
-      "name": "Jane Smith",
-      "role": "VP of Marketing",
-      "department": "Marketing",
-      "seniority": "VP",
+      "name": "",
+      "role": "",
+      "department": "",
+      "seniority": "",
       "location": "",
-      "email": "jane.smith@company.com",
+      "email": "",
       "email_status": "public",
       "possible_emails": [],
       "profile_url": "",
       "source_url": "",
-      "reason": "Publicly listed employee and email"
-    },
-    {
-      "name": "John Doe",
-      "role": "Head of Marketing",
-      "department": "Marketing",
-      "seniority": "Head",
-      "location": "",
-      "email": "",
-      "email_status": "inferred",
-      "possible_emails": [
-        {
-          "email": "john.doe@company.com",
-          "type": "inferred",
-          "confidence": "high",
-          "reason": "Matches the firstname.lastname pattern found in public company emails"
-        }
-      ],
-      "profile_url": "",
-      "source_url": "",
-      "reason": "Person publicly identified at company"
+      "reason": ""
     }
   ],
-  "notes": [
-    "Only publicly supported information was included."
-  ],
-  "reply": "Short natural-language summary of what was found."
+  "notes": [],
+  "reply": ""
 }
 
-IMPORTANT:
+============================================================
+IMPORTANT
+============================================================
 
-- Respect the requested count when possible.
-- If the user asks for 10 people, try to find 10.
-- Do not fabricate people just to reach the requested count.
-- Prefer official company pages, company leadership pages,
-  conference pages, public articles, interviews and other credible sources.
-- A LinkedIn URL may be included when publicly discoverable.
-- Search for actual public emails before inferring anything.
-- If public employee emails reveal a pattern, document that evidence.
-- Generate at most 3 possible emails per person.
-- Only generate possible emails when the pattern has evidence.
-- If no evidence supports an email pattern, leave possible_emails empty.
-- Keep the final reply short.
+Return the PEOPLE you actually found.
+
+Do NOT put the people only inside "reply".
+
+"reply" should be a short human-readable summary.
+
+If you found 4 people, people must contain 4 people.
+
+If you found 0 people, people must be [].
+
+The requested count is a maximum, not a requirement to invent
+people.
+
+Never invent a person merely to reach the requested count.
+
+Keep results concise and useful.
 """
 
 
-# ---------------------------------------------------------
+# ============================================================
 # OPENROUTER RESEARCH
-# ---------------------------------------------------------
+# ============================================================
 
-async def openrouter_research(user_message: str) -> dict:
+async def openrouter_research(
+    user_message: str
+) -> dict:
+
     if not OPENROUTER_API_KEY:
-        return {
-            "company": "",
-            "domain": "",
-            "people": [],
-            "notes": ["OPENROUTER_API_KEY is not configured."],
-            "reply": "OpenRouter is not configured. Add OPENROUTER_API_KEY to your environment variables."
-        }
+        return empty_response(
+            "OPENROUTER_API_KEY is not configured."
+        )
 
     headers = {
-        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+        "Authorization": (
+            f"Bearer {OPENROUTER_API_KEY}"
+        ),
         "Content-Type": "application/json",
         "HTTP-Referer": APP_URL,
         "X-Title": "LeadFinder AI"
     }
+
+    user_prompt = f"""
+Research this business-contact request:
+
+{user_message}
+
+Use public web search.
+
+Understand the company, requested department/role,
+seniority, location, and requested number of contacts.
+
+Return structured JSON exactly according to the system
+instructions.
+"""
 
     payload = {
         "model": OPENROUTER_MODEL,
@@ -249,34 +727,39 @@ async def openrouter_research(user_message: str) -> dict:
             },
             {
                 "role": "user",
-                "content": user_message
+                "content": user_prompt
             }
         ],
 
+        # OpenRouter server-side public web search.
         "tools": [
             {
                 "type": "openrouter:web_search",
                 "parameters": {
                     "engine": "auto",
                     "max_results": 5,
-                    "max_total_results": 15
-                }
-            },
-            {
-                "type": "openrouter:web_fetch",
-                "parameters": {
-                    "engine": "openrouter",
-                    "max_content_tokens": 20000
+                    "max_total_results": 10
                 }
             }
         ],
 
-        "temperature": 0.1,
-        "max_tokens": 5000
+        "temperature": 0,
+
+        # Enough room for structured results,
+        # while keeping the response reasonably fast.
+        "max_tokens": 3500
     }
 
     try:
-        async with httpx.AsyncClient(timeout=120) as client:
+
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(
+                connect=10,
+                read=45,
+                write=15,
+                pool=10
+            )
+        ) as client:
 
             response = await client.post(
                 OPENROUTER_URL,
@@ -284,231 +767,277 @@ async def openrouter_research(user_message: str) -> dict:
                 json=payload
             )
 
-            if response.status_code != 200:
-                try:
-                    error_data = response.json()
-                except Exception:
-                    error_data = response.text
+        # ----------------------------------------------------
+        # OpenRouter error
+        # ----------------------------------------------------
 
-                return {
-                    "company": "",
-                    "domain": "",
-                    "people": [],
-                    "notes": [
-                        f"OpenRouter error: HTTP {response.status_code}",
-                        str(error_data)
-                    ],
-                    "reply": "The AI research request failed."
-                }
+        if response.status_code != 200:
 
-            data = response.json()
+            try:
+                error_data = response.json()
+            except Exception:
+                error_data = response.text
 
-            choices = data.get("choices", [])
+            print(
+                "OPENROUTER ERROR:",
+                response.status_code,
+                error_data
+            )
 
-            if not choices:
-                return {
-                    "company": "",
-                    "domain": "",
-                    "people": [],
-                    "notes": ["OpenRouter returned no choices."],
-                    "reply": "No research result was returned."
-                }
+            result = empty_response(
+                f"Research service returned HTTP "
+                f"{response.status_code}."
+            )
 
-            message = choices[0].get("message", {})
-
-            content = message.get("content", "")
-
-            # Some providers may return structured content
-            if isinstance(content, list):
-                text_parts = []
-
-                for item in content:
-                    if isinstance(item, dict):
-                        if item.get("type") == "text":
-                            text_parts.append(item.get("text", ""))
-                    elif isinstance(item, str):
-                        text_parts.append(item)
-
-                content = "\n".join(text_parts)
-
-            result = clean_json(content)
-
-            if not isinstance(result, dict):
-                result = {
-                    "company": "",
-                    "domain": "",
-                    "people": [],
-                    "notes": [],
-                    "reply": str(result)
-                }
+            result["notes"] = [
+                "OpenRouter request failed.",
+                f"HTTP status: {response.status_code}"
+            ]
 
             return result
 
-    except httpx.TimeoutException:
-        return {
-            "company": "",
-            "domain": "",
-            "people": [],
-            "notes": ["OpenRouter request timed out."],
-            "reply": "The research took too long and timed out. Please try again."
-        }
+        # ----------------------------------------------------
+        # Parse response
+        # ----------------------------------------------------
 
-    except Exception as e:
-        return {
-            "company": "",
-            "domain": "",
-            "people": [],
-            "notes": [f"Research error: {str(e)}"],
-            "reply": "Something went wrong while researching the request."
-        }
+        data = response.json()
 
+        print(
+            "OPENROUTER MODEL:",
+            data.get(
+                "model",
+                OPENROUTER_MODEL
+            )
+        )
 
-# ---------------------------------------------------------
-# NORMALIZE RESULTS
-# ---------------------------------------------------------
-
-def normalize_person(person: dict) -> dict:
-    return {
-        "name": person.get("name", ""),
-        "role": person.get("role", ""),
-        "department": person.get("department", ""),
-        "seniority": person.get("seniority", ""),
-        "location": person.get("location", ""),
-
-        "email": person.get("email", ""),
-
-        "email_status": person.get(
-            "email_status",
-            "not_found"
-        ),
-
-        "possible_emails": person.get(
-            "possible_emails",
+        choices = data.get(
+            "choices",
             []
-        ),
+        )
 
-        "email_pattern": person.get(
-            "email_pattern",
-            None
-        ),
+        if not choices:
+            return empty_response(
+                "The research service returned no result."
+            )
 
-        "profile_url": person.get(
-            "profile_url",
-            ""
-        ),
+        message = choices[0].get(
+            "message",
+            {}
+        )
 
-        "source_url": person.get(
-            "source_url",
-            ""
-        ),
-
-        "reason": person.get(
-            "reason",
+        content = message.get(
+            "content",
             ""
         )
-    }
+
+        # Some providers can return content as an array.
+        if isinstance(content, list):
+
+            parts = []
+
+            for item in content:
+
+                if isinstance(item, dict):
+
+                    if item.get("type") == "text":
+                        parts.append(
+                            safe_string(
+                                item.get("text")
+                            )
+                        )
+
+                elif isinstance(item, str):
+                    parts.append(item)
+
+            content = "\n".join(parts)
+
+        content = safe_string(content)
+
+        # ----------------------------------------------------
+        # Parse structured JSON.
+        # ----------------------------------------------------
+
+        result = clean_json(content)
+
+        if not isinstance(result, dict):
+
+            print(
+                "OPENROUTER INVALID JSON:",
+                content[:2000]
+            )
+
+            return empty_response(
+                "The research service returned an "
+                "unexpected response format."
+            )
+
+        return normalize_result(result)
+
+    except httpx.TimeoutException:
+
+        print(
+            "OPENROUTER TIMEOUT"
+        )
+
+        return empty_response(
+            "The web research took too long. "
+            "Please try again."
+        )
+
+    except httpx.RequestError as exc:
+
+        print(
+            "OPENROUTER REQUEST ERROR:",
+            repr(exc)
+        )
+
+        return empty_response(
+            "Could not connect to the research service."
+        )
+
+    except Exception as exc:
+
+        print(
+            "OPENROUTER EXCEPTION:",
+            repr(exc)
+        )
+
+        return empty_response(
+            "Something went wrong while researching."
+        )
 
 
-# ---------------------------------------------------------
-# REQUEST MODEL
-# ---------------------------------------------------------
-
-class ChatIn(BaseModel):
-    message: str
-
-
-# ---------------------------------------------------------
+# ============================================================
 # CHAT API
-# ---------------------------------------------------------
+# ============================================================
 
 @app.post("/api/chat")
 async def chat(body: ChatIn):
 
-    message = body.message.strip()
+    message = safe_string(
+        body.message
+    )
 
     if not message:
-        return {
-            "steps": [],
-            "results": [],
-            "reply": "Tell me who you want to find."
-        }
+        result = empty_response(
+            "Please enter a company/contact request."
+        )
+
+        result["steps"] = [
+            "Waiting for a request..."
+        ]
+
+        return result
 
     steps = [
-        "Understanding your request…",
-        "Searching the public web…",
-        "Finding relevant people…",
-        "Checking public email evidence…"
+        "Understanding your request...",
+        "Searching public sources...",
+        "Matching relevant people..."
     ]
 
-    result = await openrouter_research(message)
+    result = await openrouter_research(
+        message
+    )
 
-    people = result.get("people", [])
+    # Add processing information for the UI.
+    result["steps"] = steps + [
+        f"Found {result.get('count', 0)} "
+        f"relevant contact"
+        f"{'s' if result.get('count', 0) != 1 else ''}."
+    ]
+
+    # --------------------------------------------------------
+    # Make absolutely sure the count is tied to actual
+    # structured contacts.
+    # --------------------------------------------------------
+
+    people = result.get(
+        "people",
+        []
+    )
 
     if not isinstance(people, list):
         people = []
 
-    normalized_people = []
+    result["people"] = people
+    result["results"] = people
+    result["count"] = len(people)
 
-    for person in people:
-        if isinstance(person, dict):
-            normalized_people.append(
-                normalize_person(person)
-            )
-
-    # Keep requested result count reasonable
-    normalized_people = normalized_people[:25]
-
-    result["people"] = normalized_people
-
-    # Frontend compatibility
-    result["results"] = normalized_people
-
-    result["steps"] = steps + [
-        f"Found {len(normalized_people)} supported people."
-    ]
+    # --------------------------------------------------------
+    # If the model somehow returned contacts but an empty
+    # reply, create one.
+    # --------------------------------------------------------
 
     if not result.get("reply"):
-        company = result.get("company", "")
 
-        if normalized_people:
+        company = result.get(
+            "company",
+            ""
+        )
+
+        if people:
+
             result["reply"] = (
-                f"I found {len(normalized_people)} relevant "
-                f"people for {company}."
+                f"Found {len(people)} relevant "
+                f"public contact"
+                f"{'s' if len(people) != 1 else ''}"
+                f"{' at ' + company if company else ''}."
             )
+
         else:
+
             result["reply"] = (
-                "I couldn't find enough publicly supported contacts "
-                "for that request."
+                "No matching public contacts were found."
             )
 
     return result
 
 
-# ---------------------------------------------------------
-# HEALTH
-# ---------------------------------------------------------
+# ============================================================
+# HEALTH CHECK
+# ============================================================
 
 @app.get("/api/health")
-def health():
+async def health():
 
     return {
         "ok": True,
-        "openrouter_configured": bool(OPENROUTER_API_KEY),
+        "service": "LeadFinder AI",
+        "openrouter_configured": bool(
+            OPENROUTER_API_KEY
+        ),
         "model": OPENROUTER_MODEL
     }
 
 
-# ---------------------------------------------------------
-# FRONTEND
-# ---------------------------------------------------------
+# ============================================================
+# STATIC FRONTEND
+# ============================================================
 
 @app.get("/")
-def index():
-    return FileResponse("static/index.html")
+async def index():
+
+    index_file = STATIC_DIR / "index.html"
+
+    if not index_file.exists():
+
+        return {
+            "ok": True,
+            "message": "LeadFinder API is running.",
+            "frontend": "static/index.html not found"
+        }
+
+    return FileResponse(
+        index_file
+    )
 
 
-app.mount(
-    "/static",
-    StaticFiles(directory="static"),
-    name="static"
-)
+if STATIC_DIR.exists():
+
+    app.mount(
+        "/static",
+        StaticFiles(
+            directory=STATIC_DIR
+        ),
+        name="static"
+    )
