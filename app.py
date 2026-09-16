@@ -737,17 +737,20 @@ instructions.
                 "type": "openrouter:web_search",
                 "parameters": {
                     "engine": "auto",
-                    "max_results": 5,
-                    "max_total_results": 10
+                    "max_results": 3,
+                    "max_total_results": 6,
+                    "search_context_size": "low"
                 }
             }
         ],
 
         "temperature": 0,
 
-        # Enough room for structured results,
-        # while keeping the response reasonably fast.
-        "max_tokens": 3500
+        # Keep web research to a single search round for speed.
+        "max_tool_calls": 1,
+
+        # Enough room for structured results without making the response huge.
+        "max_tokens": 2200
     }
 
     try:
@@ -755,7 +758,7 @@ instructions.
         async with httpx.AsyncClient(
             timeout=httpx.Timeout(
                 connect=10,
-                read=45,
+                read=60,
                 write=15,
                 pool=10
             )
@@ -788,6 +791,7 @@ instructions.
                 f"Research service returned HTTP "
                 f"{response.status_code}."
             )
+            result["error"] = "openrouter_http_error"
 
             result["notes"] = [
                 "OpenRouter request failed.",
@@ -879,10 +883,12 @@ instructions.
             "OPENROUTER TIMEOUT"
         )
 
-        return empty_response(
+        result = empty_response(
             "The web research took too long. "
             "Please try again."
         )
+        result["error"] = "openrouter_timeout"
+        return result
 
     except httpx.RequestError as exc:
 
@@ -891,9 +897,11 @@ instructions.
             repr(exc)
         )
 
-        return empty_response(
+        result = empty_response(
             "Could not connect to the research service."
         )
+        result["error"] = "openrouter_request_error"
+        return result
 
     except Exception as exc:
 
@@ -902,9 +910,11 @@ instructions.
             repr(exc)
         )
 
-        return empty_response(
+        result = empty_response(
             "Something went wrong while researching."
         )
+        result["error"] = "openrouter_exception"
+        return result
 
 
 # ============================================================
@@ -940,11 +950,16 @@ async def chat(body: ChatIn):
     )
 
     # Add processing information for the UI.
-    result["steps"] = steps + [
-        f"Found {result.get('count', 0)} "
-        f"relevant contact"
-        f"{'s' if result.get('count', 0) != 1 else ''}."
-    ]
+    if result.get("error") == "openrouter_timeout":
+        result["steps"] = steps + ["Research timed out."]
+    elif result.get("error"):
+        result["steps"] = steps + ["Research service error."]
+    else:
+        result["steps"] = steps + [
+            f"Found {result.get('count', 0)} "
+            f"relevant contact"
+            f"{'s' if result.get('count', 0) != 1 else ''}."
+        ]
 
     # --------------------------------------------------------
     # Make absolutely sure the count is tied to actual
